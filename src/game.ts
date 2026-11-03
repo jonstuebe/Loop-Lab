@@ -1,0 +1,635 @@
+import {
+  Frustum, type Material, Matrix4, Mesh, MeshStandardMaterial, PCFShadowMap, Plane, Sphere, Vector2, Vector3,
+} from 'three';
+import {
+  EYE_HEIGHT, GRAVITY, HOLD_DISTANCE, isTouch, JUMP_SPEED, KILL_Y, MAX_FALL_SPEED, QUALITY, type PortalIndex,
+  type QualityName, WALK_SPEED, loadQuality, saveQuality,
+} from './config';
+import { Input } from './input';
+import { type Body, overlaps, physicsStep, rayBox } from './physics';
+import { PortalSystem } from './portals';
+import { Effects } from './render/effects';
+import { Gun } from './render/gun';
+import { createStage, type Stage } from './render/stage';
+import { createTextures, type GameTextures } from './render/textures';
+import { Hud } from './ui/hud';
+import { type CardSpec, Overlay } from './ui/overlay';
+import { LEVELS } from './world/levels';
+import { ButtonProp, CUBE_SIZE, createCubeMesh, GoalProp, type Spring, springStep } from './world/props';
+import { type Block, type Collider, type Surface, World } from './world/world';
+
+type GameState = 'start' | 'play' | 'done' | 'settings';
+
+interface Cube extends Body {
+  held: boolean;
+  spawn: Vector3;
+  /** Collider the player stands on / bumps into while the cube is not held. */
+  collider: Collider;
+}
+
+interface Door {
+  block: Block;
+  /** 0 = closed, 1 = fully open. */
+  t: number;
+  baseY: number;
+}
+
+const PLAYER_HALF = new Vector3(0.3, 0.9, 0.3);
+const GRAB_RANGE = 2.6;
+/** A held cube is dropped if it gets snagged this far from where it should be. */
+const HOLD_BREAK_DISTANCE = 3.2;
+const JUMP_BUFFER = 0.15;
+const DOOR_HEIGHT = 2.6;
+/** Max simulation step; longer frames are subdivided so fast falls don't tunnel. */
+const MAX_SUBSTEP = 0.0085;
+
+export class Game {
+  private readonly stage: Stage;
+  private readonly textures: GameTextures;
+  private readonly materials: Record<Surface, MeshStandardMaterial>;
+  private readonly world: World;
+  private readonly portals: PortalSystem;
+  private readonly gun = new Gun();
+  private readonly effects: Effects;
+  private readonly hud = new Hud();
+  private readonly overlay = new Overlay();
+  private readonly input: Input;
+  private readonly cubeMesh: ReturnType<typeof createCubeMesh>;
+
+  private readonly player: Body = {
+    pos: new Vector3(), vel: new Vector3(), half: PLAYER_HALF.clone(), onGround: false, isPlayer: true,
+  };
+  private yaw = 0;
+  private pitch = 0;
+  /** Camera dip when landing hard. */
+  private readonly dip: Spring = { x: 0, v: 0 };
+  private jumpBuffer = 0;
+
+  private cube: Cube | null = null;
+  private button: { pos: Vector3; prop: ButtonProp } | null = null;
+  private door: Door | null = null;
+  private goal: { pos: Vector3; prop: GoalProp } | null = null;
+
+  private levelIndex = 0;
+  private state: GameState = 'start';
+  private settingsReturn: { state: GameState; card: CardSpec | null } | null = null;
+
+  private quality: QualityName;
+  private rtScale: number;
+  private readonly drawSize = new Vector2();
+
+  private time = 0;
+  private lastFrame = performance.now();
+  private fpsTime = 0;
+  private fpsFrames = 0;
+
+  constructor(canvas: HTMLCanvasElement) {
+    this.stage = createStage(canvas);
+    const { scene, camera } = this.stage;
+
+    this.textures = createTextures();
+    this.materials = {
+      white: new MeshStandardMaterial({ map: this.textures.white, roughness: 0.55, metalness: 0, envMapIntensity: 0.55 }),
+      metal: new MeshStandardMaterial({ map: this.textures.metal, roughness: 0.42, metalness: 0.1, envMapIntensity: 0.7 }),
+      door: new MeshStandardMaterial({ map: this.textures.door, roughness: 0.4, metalness: 0, envMapIntensity: 0.6 }),
+    };
+    this.world = new World(this.materials);
+    scene.add(this.world.group);
+
+    this.portals = new PortalSystem(scene);
+    this.effects = new Effects(scene);
+    camera.add(this.gun.group);
+    this.cubeMesh = createCubeMesh(this.textures.cube, this.textures.cubeEmissive);
+
+    this.input = new Input(canvas, {
+      isPlaying: () => this.state === 'play',
+      look: (dx, dy, s) => this.look(dx, dy, s),
+      shoot: (i) => this.shoot(i),
+      jump: () => { this.jumpBuffer = JUMP_BUFFER; },
+      grab: () => this.toggleGrab(),
+      restart: () => this.loadLevel(this.levelIndex),
+      openSettings: () => this.openSettings(),
+    });
+
+    this.quality = loadQuality();
+    this.rtScale = QUALITY[this.quality].rt;
+    window.addEventListener('resize', () => this.onResize());
+  }
+
+  start(): void {
+    this.applyQuality(this.quality);
+    this.loadLevel(0);
+    this.showStart();
+    requestAnimationFrame(this.frame);
+  }
+
+  // ---------- levels ----------
+
+  private loadLevel(index: number): void {
+    this.levelIndex = index;
+    this.world.clear(new Set([this.cubeMesh]));
+    const level = LEVELS[index];
+    const setup = level.build(this.world);
+
+    this.portals.reset();
+    this.player.pos.set(setup.spawn[0], setup.spawn[1] + this.player.half.y + 0.002, setup.spawn[2]);
+    this.player.vel.set(0, 0, 0);
+    this.yaw = setup.yaw;
+    this.pitch = 0;
+    this.dip.x = this.dip.v = 0;
+
+    this.cube = null;
+    this.button = null;
+    this.door = null;
+    if (setup.cube) {
+      const half = CUBE_SIZE / 2;
+      this.cube = {
+        pos: new Vector3(...setup.cube), vel: new Vector3(), half: new Vector3(half, half, half),
+        onGround: false, isPlayer: false, held: false, spawn: new Vector3(...setup.cube),
+        collider: { min: new Vector3(), max: new Vector3(), active: true },
+      };
+      this.world.add(this.cubeMesh);
+      this.cubeMesh.position.copy(this.cube.pos);
+      this.cubeMesh.rotation.set(0, 0, 0);
+    }
+    if (setup.button) {
+      const prop = new ButtonProp(this.gun.darkMaterial);
+      prop.group.position.set(...setup.button);
+      this.world.add(prop.group);
+      this.button = { pos: new Vector3(...setup.button), prop };
+    }
+    if (setup.door) {
+      this.door = { block: setup.door, t: 0, baseY: setup.door.mesh.position.y };
+    }
+    const goal = new GoalProp();
+    goal.group.position.set(...setup.goal);
+    this.world.add(goal.group);
+    this.goal = { pos: new Vector3(...setup.goal), prop: goal };
+
+    this.fitShadowToLevel();
+    this.hud.showLevel(index, LEVELS.length, level.name, level.hint);
+    this.updateCrosshair();
+  }
+
+  /** Points the sun's orthographic shadow camera so it just covers the level. */
+  private fitShadowToLevel(): void {
+    const { sun } = this.stage;
+    const bounds = this.world.bounds();
+    const center = bounds.getCenter(new Vector3());
+    const radius = bounds.getSize(new Vector3()).length() / 2;
+    sun.position.copy(center).add(new Vector3(0.42, 1, 0.3).normalize().multiplyScalar(radius + 10));
+    sun.target.position.copy(center);
+    sun.target.updateMatrixWorld();
+    const cam = sun.shadow.camera;
+    cam.left = -radius;
+    cam.right = radius;
+    cam.top = radius;
+    cam.bottom = -radius;
+    cam.near = 1;
+    cam.far = 2 * radius + 25;
+    cam.updateProjectionMatrix();
+  }
+
+  // ---------- player actions ----------
+
+  private eyePosition(): Vector3 {
+    return new Vector3(this.player.pos.x, this.player.pos.y + EYE_HEIGHT, this.player.pos.z);
+  }
+
+  private forward(): Vector3 {
+    const cp = Math.cos(this.pitch);
+    return new Vector3(-Math.sin(this.yaw) * cp, Math.sin(this.pitch), -Math.cos(this.yaw) * cp);
+  }
+
+  private look(dx: number, dy: number, sensitivity: number): void {
+    this.yaw -= dx * sensitivity;
+    this.pitch = Math.max(-1.55, Math.min(1.55, this.pitch - dy * sensitivity));
+  }
+
+  private shoot(index: PortalIndex): void {
+    if (this.state !== 'play') return;
+    const origin = this.eyePosition();
+    const dir = this.forward();
+    const hit = this.world.raycast(origin, dir);
+    const color = this.portals.list[index].color;
+    this.gun.fire(color);
+
+    const end = origin.clone().addScaledVector(dir, hit ? hit.t : 60);
+    this.stage.camera.updateMatrixWorld();
+    this.effects.tracer(this.gun.tipWorldPosition(new Vector3()), end, color);
+    if (!hit) return;
+
+    if (hit.block.type !== 'white') {
+      this.effects.impact(end, hit.normal, 0xb8c4d6, 0.5);
+      this.hud.toast('Portals only stick to cream panels');
+      return;
+    }
+    const portal = this.portals.place(index, end, hit.normal, dir, hit.block, this.world.blocks);
+    if (portal) {
+      this.effects.impact(portal.center, portal.normal, color, 1.4);
+      this.updateCrosshair();
+    } else {
+      this.effects.impact(end, hit.normal, 0xb8c4d6, 0.5);
+      this.hud.toast('Not enough room for a portal there');
+    }
+  }
+
+  private toggleGrab(): void {
+    const cube = this.cube;
+    if (this.state !== 'play' || !cube) return;
+    if (cube.held) {
+      cube.held = false;
+      cube.vel.copy(this.player.vel);
+      return;
+    }
+    const origin = this.eyePosition();
+    const dir = this.forward();
+    const hit = rayBox(origin, dir, cube.pos.clone().sub(cube.half), cube.pos.clone().add(cube.half));
+    if (hit && hit.t < GRAB_RANGE) {
+      const wall = this.world.raycast(origin, dir);
+      if (!wall || wall.t > hit.t) {
+        cube.held = true;
+        return;
+      }
+    }
+    this.hud.toast('Look at the cube to pick it up');
+  }
+
+  private updateCrosshair(): void {
+    this.hud.setCrosshair(this.portals.list[0].placed, this.portals.list[1].placed);
+  }
+
+  // ---------- simulation ----------
+
+  private update(dt: number): void {
+    const { player, input } = this;
+
+    // Movement input in camera space: x = strafe right, z = forward.
+    let ix = 0;
+    let iz = 0;
+    if (input.isDown('KeyW') || input.isDown('ArrowUp')) iz += 1;
+    if (input.isDown('KeyS') || input.isDown('ArrowDown')) iz -= 1;
+    if (input.isDown('KeyD')) ix += 1;
+    if (input.isDown('KeyA')) ix -= 1;
+    if (input.isDown('ArrowLeft')) this.yaw += 2.2 * dt;
+    if (input.isDown('ArrowRight')) this.yaw -= 2.2 * dt;
+    ix += input.joystick.x;
+    iz += input.joystick.y;
+    const il = Math.hypot(ix, iz);
+    if (il > 1) { ix /= il; iz /= il; }
+    const sy = Math.sin(this.yaw);
+    const cy = Math.cos(this.yaw);
+    const wx = -sy * iz + cy * ix;
+    const wz = -cy * iz - sy * ix;
+    const wl = Math.hypot(wx, wz);
+
+    const v = player.vel;
+    if (player.onGround) {
+      const k = 1 - Math.exp(-14 * dt);
+      v.x += (wx * WALK_SPEED - v.x) * k;
+      v.z += (wz * WALK_SPEED - v.z) * k;
+    } else if (wl > 0.01) {
+      // Air control only adds speed up to walking pace, so flings keep their momentum.
+      const dx = wx / wl;
+      const dz = wz / wl;
+      const current = v.x * dx + v.z * dz;
+      const add = WALK_SPEED * Math.min(1, wl) - current;
+      if (add > 0) {
+        const acc = Math.min(add, 24 * dt);
+        v.x += dx * acc;
+        v.z += dz * acc;
+      }
+    }
+    this.jumpBuffer -= dt;
+    if (this.jumpBuffer > 0 && player.onGround) {
+      v.y = JUMP_SPEED;
+      player.onGround = false;
+      this.jumpBuffer = 0;
+    }
+    v.y = Math.max(v.y - GRAVITY * dt, -MAX_FALL_SPEED);
+
+    const cube = this.cube;
+    const playerColliders: Collider[] = [...this.world.blocks];
+    if (cube && !cube.held) {
+      cube.collider.min.copy(cube.pos).sub(cube.half);
+      cube.collider.max.copy(cube.pos).add(cube.half);
+      playerColliders.push(cube.collider);
+    }
+    const wasGrounded = player.onGround;
+    const vyBefore = v.y;
+    const transfer = physicsStep(player, dt, playerColliders, this.portals);
+    if (transfer) this.onPlayerTeleported(transfer);
+    if (!wasGrounded && player.onGround && vyBefore < -4) this.dip.v += Math.max(vyBefore, -30) * 0.07;
+
+    if (cube) this.updateCube(cube, dt);
+    this.updateButtonAndDoor(dt);
+
+    if (this.goal) {
+      const gp = this.goal.pos;
+      const feetY = player.pos.y - player.half.y;
+      if (Math.hypot(player.pos.x - gp.x, player.pos.z - gp.z) < 0.85 && feetY > gp.y - 0.3 && feetY < gp.y + 1.2) {
+        this.completeLevel();
+      }
+    }
+    if (player.pos.y < KILL_Y) this.loadLevel(this.levelIndex);
+  }
+
+  /** Keep looking the "same" way relative to the exit portal. */
+  private onPlayerTeleported(transfer: Matrix4): void {
+    const f = this.forward().transformDirection(transfer);
+    this.pitch = Math.max(-1.5, Math.min(1.5, Math.asin(Math.max(-1, Math.min(1, f.y)))));
+    if (Math.abs(f.y) < 0.999) this.yaw = Math.atan2(-f.x, -f.z);
+    const cube = this.cube;
+    if (cube?.held) {
+      cube.pos.copy(this.eyePosition()).addScaledVector(this.forward(), HOLD_DISTANCE);
+      cube.vel.set(0, 0, 0);
+    }
+  }
+
+  private updateCube(cube: Cube, dt: number): void {
+    if (cube.held) {
+      const target = this.eyePosition().addScaledVector(this.forward(), HOLD_DISTANCE);
+      const delta = target.sub(cube.pos);
+      if (delta.length() > HOLD_BREAK_DISTANCE) {
+        cube.held = false;
+      } else {
+        // Drive the cube toward the hold point through the collision solver so it can't enter walls.
+        cube.vel.copy(delta).multiplyScalar(1 / dt);
+        if (cube.vel.length() > 30) cube.vel.setLength(30);
+        physicsStep(cube, dt, this.world.blocks, null);
+        cube.vel.set(0, 0, 0);
+      }
+    }
+    if (!cube.held) {
+      cube.vel.y = Math.max(cube.vel.y - GRAVITY * dt, -MAX_FALL_SPEED);
+      if (cube.onGround) {
+        const k = Math.exp(-8 * dt);
+        cube.vel.x *= k;
+        cube.vel.z *= k;
+      }
+      physicsStep(cube, dt, this.world.blocks, this.portals);
+      if (cube.pos.y < KILL_Y) {
+        cube.pos.copy(cube.spawn);
+        cube.vel.set(0, 0, 0);
+      }
+    }
+  }
+
+  private updateButtonAndDoor(dt: number): void {
+    const { button, door, player, cube } = this;
+    if (button) {
+      const bp = button.pos;
+      const onButton = (x: number, feetY: number, z: number) =>
+        Math.hypot(x - bp.x, z - bp.z) < 0.85 && feetY >= bp.y - 0.2 && feetY < bp.y + 0.4;
+      const byCube = !!cube && !cube.held && onButton(cube.pos.x, cube.pos.y - cube.half.y, cube.pos.z);
+      const byPlayer = player.onGround && onButton(player.pos.x, player.pos.y - player.half.y, player.pos.z);
+      button.prop.pressed = byCube || byPlayer;
+    }
+    if (door) {
+      const target = button?.prop.pressed ? 1 : 0;
+      door.t += Math.sign(target - door.t) * Math.min(Math.abs(target - door.t), dt * 2.5);
+      door.block.active = door.t < 0.85;
+      // Never crush the player: if the door closes on them, hold it open.
+      if (door.block.active && overlaps(player, door.block)) {
+        door.block.active = false;
+        door.t = Math.max(door.t, 0.85);
+      }
+    }
+  }
+
+  // ---------- screens ----------
+
+  private showStart(): void {
+    this.state = 'start';
+    this.overlay.showCard({
+      html: `<h1><span class="ring"></span><span class="ring o"></span> Loop Lab</h1>
+        <p>Two linked portals, three test chambers. Reach the glowing green exit in each one.</p>
+        <p><strong>Portals only stick to cream panels.</strong> Blue metal won’t take them. Whatever goes in one comes out the other, keeping its speed.</p>
+        ${controlsHtml()}`,
+      label: 'Enter chamber 1',
+      onGo: () => this.resumePlay(),
+    });
+  }
+
+  private resumePlay(): void {
+    this.state = 'play';
+    this.input.tryLock();
+    this.input.updateResumeHint();
+  }
+
+  private completeLevel(): void {
+    this.state = 'done';
+    this.input.release();
+    const index = this.levelIndex;
+    if (index === LEVELS.length - 1) {
+      this.overlay.showCard({
+        html: `<h1>All chambers cleared!</h1><p>You thought with portals through all ${LEVELS.length} chambers, including the fling. Nicely done.</p>`,
+        label: 'Play again from chamber 1',
+        onGo: () => { this.loadLevel(0); this.resumePlay(); },
+      });
+    } else {
+      this.overlay.showCard({
+        html: `<h1>${LEVELS[index].name} cleared!</h1><p>Next up is chamber ${index + 2}: ${LEVELS[index + 1].name}.</p>`,
+        label: `Enter chamber ${index + 2}`,
+        onGo: () => { this.loadLevel(index + 1); this.resumePlay(); },
+      });
+    }
+  }
+
+  private openSettings(): void {
+    if (this.state === 'settings') return;
+    this.settingsReturn = { state: this.state, card: this.overlay.current };
+    const from = this.state;
+    this.state = 'settings';
+    this.input.release();
+    this.overlay.showSettings({
+      current: this.quality,
+      closeLabel: from === 'play' ? 'Back to the chamber' : 'Done',
+      onSelect: (q) => this.applyQuality(q),
+      onClose: () => this.closeSettings(),
+    });
+  }
+
+  private closeSettings(): void {
+    const from = this.settingsReturn;
+    this.settingsReturn = null;
+    if (!from) return;
+    if (from.card) {
+      this.state = from.state;
+      this.overlay.showCard(from.card);
+    } else {
+      this.overlay.hide();
+      if (from.state === 'play') this.resumePlay();
+      else this.state = from.state;
+    }
+  }
+
+  // ---------- graphics ----------
+
+  private applyQuality(name: QualityName): void {
+    const q = QUALITY[name];
+    this.quality = name;
+    const { renderer, scene, sun } = this.stage;
+    const dpr = window.devicePixelRatio || 1;
+    renderer.setPixelRatio(name === 'low' ? Math.min(dpr, 1) * q.ratio : Math.min(dpr, q.ratio));
+    this.rtScale = q.rt;
+
+    const shadows = q.shadow > 0;
+    renderer.shadowMap.enabled = shadows;
+    renderer.shadowMap.type = PCFShadowMap;
+    sun.castShadow = shadows;
+    if (shadows) {
+      sun.shadow.mapSize.set(q.shadow, q.shadow);
+      sun.shadow.radius = q.soft ? 3 : 1;
+      if (sun.shadow.map) {
+        sun.shadow.map.dispose();
+        sun.shadow.map = null;
+      }
+    }
+
+    const maxAniso = renderer.capabilities.getMaxAnisotropy();
+    for (const t of this.textures.all) {
+      t.anisotropy = Math.min(q.aniso, maxAniso);
+      t.needsUpdate = true;
+    }
+    // Shadow settings are compiled into shaders, so every material must recompile.
+    const materials = new Set<Material>([
+      ...Object.values(this.materials), ...this.gun.materials, this.cubeMesh.material,
+    ]);
+    scene.traverse((o) => {
+      if (o instanceof Mesh) {
+        for (const m of Array.isArray(o.material) ? o.material : [o.material]) materials.add(m);
+      }
+    });
+    for (const m of materials) m.needsUpdate = true;
+
+    this.onResize();
+    saveQuality(name);
+  }
+
+  private onResize(): void {
+    const { renderer, camera } = this.stage;
+    renderer.setSize(window.innerWidth, window.innerHeight, false);
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.getDrawingBufferSize(this.drawSize);
+    this.portals.resize(this.drawSize, this.rtScale);
+  }
+
+  // ---------- frame loop ----------
+
+  private readonly frame = (now: number): void => {
+    requestAnimationFrame(this.frame);
+    const rawDt = (now - this.lastFrame) / 1000;
+    this.lastFrame = now;
+    const dt = Math.min(rawDt, 0.05);
+    this.time += dt;
+    this.portals.time.value = this.time;
+
+    this.fpsTime += rawDt;
+    this.fpsFrames++;
+    if (this.fpsTime >= 0.5) {
+      this.overlay.setFps(this.fpsFrames / this.fpsTime);
+      this.fpsTime = 0;
+      this.fpsFrames = 0;
+    }
+
+    if (this.state === 'play') {
+      const steps = dt > 0.012 ? Math.ceil(dt / MAX_SUBSTEP) : 1;
+      for (let i = 0; i < steps && this.state === 'play'; i++) this.update(dt / steps);
+    }
+
+    this.animate(dt);
+    this.render();
+  };
+
+  /** Purely visual per-frame animation. */
+  private animate(dt: number): void {
+    this.portals.animate(dt);
+    this.effects.update(dt);
+    if (this.cube) {
+      this.cubeMesh.position.copy(this.cube.pos);
+      if (this.cube.held) this.cubeMesh.rotation.set(0, this.yaw, 0);
+    }
+    this.button?.prop.animate(dt);
+    if (this.door) this.door.block.mesh.position.y = this.door.baseY + this.door.t * DOOR_HEIGHT;
+    this.goal?.prop.animate(this.time);
+
+    springStep(this.dip, 0, 140, 11, dt);
+    this.dip.x = Math.max(-0.3, this.dip.x);
+    const p = this.player;
+    this.gun.animate(dt, p.onGround ? Math.hypot(p.vel.x, p.vel.z) : 0, this.dip.x);
+    this.hud.update(dt);
+  }
+
+  private readonly frustum = new Frustum();
+  private readonly viewProjection = new Matrix4();
+  private readonly portalSphere = new Sphere();
+  private readonly clipPlane = new Plane();
+
+  private render(): void {
+    const { renderer, scene, camera, portalCamera } = this.stage;
+    camera.position.set(this.player.pos.x, this.player.pos.y + EYE_HEIGHT + this.dip.x, this.player.pos.z);
+    camera.rotation.set(this.pitch, this.yaw, 0);
+    camera.updateMatrixWorld();
+    camera.matrixWorldInverse.copy(camera.matrixWorld).invert();
+    if (renderer.shadowMap.enabled) renderer.shadowMap.needsUpdate = true;
+
+    const open = this.portals.bothOpen;
+    const [a, b] = this.portals.list;
+    a.setOpen(open);
+    b.setOpen(open);
+
+    if (open) {
+      // Render what each portal sees from a virtual camera behind its partner.
+      this.viewProjection.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+      this.frustum.setFromProjectionMatrix(this.viewProjection);
+      this.gun.group.visible = false;
+      a.mesh.material = a.flatMaterial;
+      b.mesh.material = b.flatMaterial;
+      portalCamera.projectionMatrix.copy(camera.projectionMatrix);
+      portalCamera.projectionMatrixInverse.copy(camera.projectionMatrixInverse);
+
+      for (const [x, y] of [[a, b], [b, a]] as const) {
+        this.portalSphere.set(x.center, 1.5);
+        if (!this.frustum.intersectsSphere(this.portalSphere)) continue;
+        // Skip portals we're looking at from behind.
+        if (camera.position.clone().sub(x.center).dot(x.normal) < -0.05) continue;
+        const m = this.portals.transferMatrix(x, y).multiply(camera.matrixWorld);
+        m.decompose(portalCamera.position, portalCamera.quaternion, portalCamera.scale);
+        x.mesh.visible = false;
+        // Clip away everything between the virtual camera and the exit wall.
+        this.clipPlane.setFromNormalAndCoplanarPoint(y.normal, y.center.clone().addScaledVector(y.normal, 0.004));
+        renderer.clippingPlanes = [this.clipPlane];
+        renderer.setRenderTarget(x.renderTarget);
+        renderer.render(scene, portalCamera);
+        x.mesh.visible = true;
+      }
+      renderer.setRenderTarget(null);
+      renderer.clippingPlanes = [];
+      a.mesh.material = a.viewMaterial;
+      b.mesh.material = b.viewMaterial;
+      this.gun.group.visible = true;
+    }
+    renderer.render(scene, camera);
+  }
+}
+
+function controlsHtml(): string {
+  if (isTouch) {
+    return `<dl class="keys">
+      <dt>Left thumb</dt><dd>Drag anywhere on the left to move</dd>
+      <dt>Right thumb</dt><dd>Drag on the right to look</dd>
+      <dt>Blue / Orange</dt><dd>Fire a portal where the crosshair points</dd>
+      <dt>Grab</dt><dd>Pick up or drop a cube</dd>
+      <dt>↺ and ⚙</dt><dd>Restart the chamber, change graphics quality</dd></dl>`;
+  }
+  return `<dl class="keys">
+    <dt>W A S D</dt><dd>Move</dd>
+    <dt>Mouse</dt><dd>Look (drag if the pointer won’t lock)</dd>
+    <dt>Left / right click</dt><dd>Fire blue / orange portal (or Q / F)</dd>
+    <dt>Space</dt><dd>Jump</dd>
+    <dt>E</dt><dd>Pick up or drop a cube</dd>
+    <dt>R</dt><dd>Restart the chamber</dd>
+    <dt>⚙ button</dt><dd>Change graphics quality</dd></dl>`;
+}

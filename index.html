@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+  <title>Loop Lab</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Fredoka:wght@400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+  <canvas id="c"></canvas>
+
+  <div class="chip" id="chip" role="button" tabindex="0" aria-label="Chamber info">
+    <div class="num" id="lvlNum"></div>
+    <div class="name" id="lvlName"></div>
+    <div class="hint" id="hint"></div>
+    <div class="tap">Tap to hide</div>
+  </div>
+  <button class="iconbtn" id="gearBtn" aria-label="Graphics settings" title="Graphics settings">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3.2"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>
+  </button>
+  <button class="iconbtn" id="resetBtn" aria-label="Restart chamber" title="Restart chamber (R)">↺</button>
+
+  <svg id="xhair" viewBox="0 0 44 44" aria-hidden="true">
+    <circle cx="22" cy="22" r="2.2" fill="#ffffff" stroke="#2c2442" stroke-opacity=".5" stroke-width="1"/>
+    <path id="xhB" d="M16 11.6 A12 12 0 0 0 16 32.4" stroke="#3aa0ff"/>
+    <path id="xhO" d="M28 11.6 A12 12 0 0 1 28 32.4" stroke="#ff8c2a"/>
+  </svg>
+  <div id="toast"></div>
+  <div id="resume">Click to look around</div>
+
+  <div id="touch">
+    <div id="joyBase"><div id="joyKnob"></div></div>
+    <button class="tbtn" id="bBlue" aria-label="Fire blue portal"><span class="dot"></span></button>
+    <button class="tbtn" id="bOrange" aria-label="Fire orange portal"><span class="dot"></span></button>
+    <button class="tbtn" id="bGrab" aria-label="Grab or drop">Grab</button>
+    <button class="tbtn" id="bJump" aria-label="Jump">Jump</button>
+  </div>
+
+  <div id="overlay"><div class="card" id="card"></div></div>
+
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>
