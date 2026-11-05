@@ -10,12 +10,13 @@ import { type Body, overlaps, physicsStep, rayBox } from './physics';
 import { PortalSystem } from './portals';
 import { Effects } from './render/effects';
 import { Gun } from './render/gun';
+import { PostFX } from './render/post';
 import { createStage, type Stage } from './render/stage';
 import { createTextures, type GameTextures } from './render/textures';
 import { Hud } from './ui/hud';
 import { type CardSpec, Overlay } from './ui/overlay';
 import { LEVELS } from './world/levels';
-import { ButtonProp, CUBE_SIZE, createCubeMesh, GoalProp, type Spring, springStep } from './world/props';
+import { animateCube, ButtonProp, CUBE_SIZE, createCubeMesh, GoalProp, type Spring, springStep } from './world/props';
 import { type Block, type Collider, type Surface, World } from './world/world';
 
 type GameState = 'start' | 'play' | 'done' | 'settings';
@@ -45,6 +46,7 @@ const MAX_SUBSTEP = 0.0085;
 
 export class Game {
   private readonly stage: Stage;
+  private readonly post: PostFX;
   private readonly textures: GameTextures;
   private readonly materials: Record<Surface, MeshStandardMaterial>;
   private readonly world: World;
@@ -86,12 +88,13 @@ export class Game {
   constructor(canvas: HTMLCanvasElement) {
     this.stage = createStage(canvas);
     const { scene, camera } = this.stage;
+    this.post = new PostFX(this.stage.renderer, scene, camera);
 
     this.textures = createTextures();
     this.materials = {
-      white: new MeshStandardMaterial({ map: this.textures.white, roughness: 0.55, metalness: 0, envMapIntensity: 0.55 }),
-      metal: new MeshStandardMaterial({ map: this.textures.metal, roughness: 0.42, metalness: 0.1, envMapIntensity: 0.7 }),
-      door: new MeshStandardMaterial({ map: this.textures.door, roughness: 0.4, metalness: 0, envMapIntensity: 0.6 }),
+      white: new MeshStandardMaterial({ ...this.textures.white, roughness: 1, metalness: 0, envMapIntensity: 0.6 }),
+      metal: new MeshStandardMaterial({ ...this.textures.metal, roughness: 1, metalness: 0.15, envMapIntensity: 0.9 }),
+      door: new MeshStandardMaterial({ ...this.textures.door, roughness: 1, metalness: 0, envMapIntensity: 0.7 }),
     };
     this.world = new World(this.materials);
     scene.add(this.world.group);
@@ -128,6 +131,7 @@ export class Game {
   private loadLevel(index: number): void {
     this.levelIndex = index;
     this.world.clear(new Set([this.cubeMesh]));
+    this.effects.clear();
     const level = LEVELS[index];
     const setup = level.build(this.world);
 
@@ -220,16 +224,19 @@ export class Game {
     if (!hit) return;
 
     if (hit.block.type !== 'white') {
-      this.effects.impact(end, hit.normal, 0xb8c4d6, 0.5);
+      this.effects.impact(end, hit.normal, 0xb8c4d6, 0.5, 0.5);
+      this.effects.sparks(end, hit.normal);
       this.hud.toast('Portals only stick to cream panels');
       return;
     }
     const portal = this.portals.place(index, end, hit.normal, dir, hit.block, this.world.blocks);
     if (portal) {
       this.effects.impact(portal.center, portal.normal, color, 1.4);
+      this.effects.portalBurst(portal.center, portal.normal, portal.up, portal.right, color);
       this.updateCrosshair();
     } else {
-      this.effects.impact(end, hit.normal, 0xb8c4d6, 0.5);
+      this.effects.impact(end, hit.normal, 0xb8c4d6, 0.5, 0.5);
+      this.effects.sparks(end, hit.normal);
       this.hud.toast('Not enough room for a portal there');
     }
   }
@@ -504,6 +511,7 @@ export class Game {
     for (const m of materials) m.needsUpdate = true;
 
     this.onResize();
+    this.post.configure(q);
     saveQuality(name);
   }
 
@@ -513,7 +521,9 @@ export class Game {
     camera.aspect = window.innerWidth / window.innerHeight;
     camera.updateProjectionMatrix();
     renderer.getDrawingBufferSize(this.drawSize);
-    this.portals.resize(this.drawSize, this.rtScale);
+    this.portals.resize(this.drawSize, this.rtScale, Math.min(QUALITY[this.quality].msaa, renderer.capabilities.maxSamples));
+    this.post.resize();
+    this.effects.particles.setViewScale(this.drawSize.y, camera.fov);
   }
 
   // ---------- frame loop ----------
@@ -546,10 +556,12 @@ export class Game {
   /** Purely visual per-frame animation. */
   private animate(dt: number): void {
     this.portals.animate(dt);
+    this.effects.ambient(dt, this.portals.list, this.goal?.pos ?? null);
     this.effects.update(dt);
     if (this.cube) {
       this.cubeMesh.position.copy(this.cube.pos);
       if (this.cube.held) this.cubeMesh.rotation.set(0, this.yaw, 0);
+      animateCube(this.cubeMesh, this.time, this.cube.held);
     }
     this.button?.prop.animate(dt);
     if (this.door) this.door.block.mesh.position.y = this.door.baseY + this.door.t * DOOR_HEIGHT;
@@ -611,7 +623,7 @@ export class Game {
       b.mesh.material = b.viewMaterial;
       this.gun.group.visible = true;
     }
-    renderer.render(scene, camera);
+    this.post.render();
   }
 }
 
