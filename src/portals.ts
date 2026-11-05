@@ -1,5 +1,5 @@
 import {
-  Color, LinearFilter, Matrix4, Mesh, PlaneGeometry, type Scene, ShaderMaterial, Vector2, Vector3,
+  Color, HalfFloatType, LinearFilter, Matrix4, Mesh, PlaneGeometry, type Scene, ShaderMaterial, Vector2, Vector3,
   WebGLRenderTarget,
 } from 'three';
 import { PORTAL_COLORS, PORTAL_HALF_H, PORTAL_HALF_W, type PortalIndex } from './config';
@@ -24,27 +24,56 @@ function fragmentShader(withView: boolean): string {
   ${withView ? 'uniform sampler2D map; uniform vec2 res; uniform float open;' : ''}
   uniform vec3 col; uniform float time; uniform float grow;
   varying vec2 vUv;
+
+  float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+
   void main() {
     vec2 p = vUv * 2.0 - 1.0;
     float r = length(p);
     if (r > grow) discard;
     float rn = r / max(grow, 0.001);
     float a = atan(p.y, p.x);
+    float aa = fwidth(rn) * 1.5;
+
+    // Closed portal: a slow, deep swirl.
     float sw = sin(a * 3.0 + time * 3.0 - rn * 9.0) * 0.5 + 0.5;
-    vec3 c = mix(col * 0.35 + 0.08, col * 1.05 + 0.1, sw * rn);
-    ${withView ? 'if (open > 0.5) { c = texture2D(map, gl_FragCoord.xy / res).rgb; c += col * 0.18 * smoothstep(0.6, 1.0, rn); }' : ''}
-    float wob = 0.012 * sin(a * 5.0 + time * 4.0);
-    float rim = smoothstep(0.80 + wob, 0.90 + wob, rn);
-    float inner = smoothstep(0.76 + wob, 0.80 + wob, rn) * (1.0 - smoothstep(0.80 + wob, 0.84 + wob, rn));
-    c = mix(c, col * 1.25 + 0.05, rim);
-    c = mix(c, vec3(1.0), inner * 0.85);
-    gl_FragColor = vec4(c, 1.0);
+    float sw2 = sin(a * 5.0 - time * 2.2 + rn * 14.0) * 0.5 + 0.5;
+    vec3 c = mix(col * 0.25 + 0.03, col * 1.3 + 0.08, sw * rn);
+    c += col * sw2 * rn * 0.35;
+    ${withView ? `if (open > 0.5) {
+      c = texture2D(map, gl_FragCoord.xy / res).rgb;
+      // tint and brighten toward the rim so the view sits inside a field of light
+      float edge = smoothstep(0.6, 0.82, rn);
+      c = mix(c, c * 0.7 + col * 1.2, edge * edge * 0.5);
+    }` : ''}
+
+    // Wobbling energy rim: HDR so the bloom pass gives it a halo.
+    float wob = 0.014 * sin(a * 5.0 + time * 4.0) + 0.008 * sin(a * 11.0 - time * 6.5);
+    float band = smoothstep(0.80 + wob - aa, 0.86 + wob, rn);
+    float flicker = 0.85 + 0.3 * sin(a * 18.0 + time * 9.0) * sin(a * 7.0 - time * 5.0);
+    vec3 rimCol = col * (2.6 + 1.6 * sw) * flicker + 0.15;
+    c = mix(c, rimCol, band);
+
+    // bright inner seam just inside the rim
+    float seam = smoothstep(0.76 + wob - aa, 0.80 + wob, rn) * (1.0 - smoothstep(0.80 + wob, 0.835 + wob + aa, rn));
+    c = mix(c, vec3(3.2) + col * 1.5, seam * 0.9);
+
+    // drifting sparks in the rim
+    vec2 cell = vec2(floor((a + 3.1416) * 9.0 + time * 1.7), floor(rn * 14.0 - time * 3.0));
+    float spark = step(0.93, hash(cell)) * band;
+    c += col * spark * 3.0;
+
+    // anti-aliased outer edge
+    float alpha = 1.0 - smoothstep(1.0 - aa * 1.5, 1.0, rn);
+    gl_FragColor = vec4(c, alpha);
   }`;
 }
 
 export class Portal {
   readonly color: number;
-  readonly renderTarget = new WebGLRenderTarget(16, 16, { minFilter: LinearFilter, magFilter: LinearFilter });
+  readonly renderTarget = new WebGLRenderTarget(16, 16, {
+    minFilter: LinearFilter, magFilter: LinearFilter, type: HalfFloatType,
+  });
   /** Material that shows the view through the portal. */
   readonly viewMaterial: ShaderMaterial;
   /** Plain swirl material, used while rendering portal views (avoids recursion). */
@@ -81,11 +110,13 @@ export class Portal {
         time,
         grow: this.grow,
       },
+      transparent: true,
     });
     this.flatMaterial = new ShaderMaterial({
       vertexShader: VERTEX_SHADER,
       fragmentShader: fragmentShader(false),
       uniforms: { col: { value: col }, time, grow: this.grow },
+      transparent: true,
     });
     this.mesh = new Mesh(new PlaneGeometry(PORTAL_HALF_W * 2, PORTAL_HALF_H * 2), this.viewMaterial);
     this.mesh.matrixAutoUpdate = false;
@@ -120,7 +151,11 @@ export class Portal {
     this.viewMaterial.uniforms.open.value = open ? 1 : 0;
   }
 
-  resize(drawSize: Vector2, rtScale: number): void {
+  resize(drawSize: Vector2, rtScale: number, samples: number): void {
+    if (this.renderTarget.samples !== samples) {
+      this.renderTarget.samples = samples;
+      this.renderTarget.dispose();
+    }
     this.renderTarget.setSize(
       Math.max(1, Math.round(drawSize.x * rtScale)),
       Math.max(1, Math.round(drawSize.y * rtScale)),
@@ -178,8 +213,8 @@ export class PortalSystem {
     for (const p of this.list) p.animate(dt);
   }
 
-  resize(drawSize: Vector2, rtScale: number): void {
-    for (const p of this.list) p.resize(drawSize, rtScale);
+  resize(drawSize: Vector2, rtScale: number, samples: number): void {
+    for (const p of this.list) p.resize(drawSize, rtScale, samples);
   }
 
   /**

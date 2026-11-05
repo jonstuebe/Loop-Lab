@@ -45,15 +45,17 @@ src/
   portals.ts            portal placement rules, shaders and render targets
   input.ts              keyboard, mouse/pointer-lock and touch controls
   render/
-    stage.ts            renderer, scene, cameras and lighting
-    textures.ts         procedurally drawn canvas textures
+    stage.ts            renderer, tone mapping, scene, cameras and lighting
+    post.ts             post-processing: MSAA, ambient occlusion, bloom
+    textures.ts         procedural colour, normal and roughness maps
     geometry.ts         tiled and rounded box geometry helpers
     gun.ts              the view-model portal device
-    effects.ts          tracers and impact rings
+    effects.ts          tracers, impact rings, sparks and scorch marks
+    particles.ts        pooled additive particle system
   world/
     world.ts            level blocks, rooms and ray casts against them
     levels.ts           chamber definitions
-    props.ts            floor button, exit pad and cube meshes
+    props.ts            floor button, exit pad, cube and floor decals
   ui/
     hud.ts              chamber info chip, crosshair and toasts
     overlay.ts          title / level-complete cards and settings sheet
