@@ -2,7 +2,7 @@
 
 A small first-person portal puzzle game built with [three.js](https://threejs.org/), TypeScript and Vite.
 
-Fire two linked portals onto the cream panels and use them to reach the glowing green exit in each of the three test chambers. Whatever goes into one portal comes out of the other, keeping its speed.
+Fire two linked portals onto the cream panels and use them to reach the glowing green exit in each of the eight test chambers. Whatever goes into one portal comes out of the other, keeping its speed.
 
 ## Getting started
 
