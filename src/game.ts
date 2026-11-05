@@ -410,7 +410,7 @@ export class Game {
     this.state = 'start';
     this.overlay.showCard({
       html: `<h1><span class="ring"></span><span class="ring o"></span> Loop Lab</h1>
-        <p>Two linked portals, three test chambers. Reach the glowing green exit in each one.</p>
+        <p>Two linked portals, ${LEVELS.length} test chambers. Reach the glowing green exit in each one.</p>
         <p><strong>Portals only stick to cream panels.</strong> Blue metal won’t take them. Whatever goes in one comes out the other, keeping its speed.</p>
         ${controlsHtml()}`,
       label: 'Enter chamber 1',
